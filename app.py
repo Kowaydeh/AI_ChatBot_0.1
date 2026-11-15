@@ -232,8 +232,7 @@ def retrieve_context(
     selected_sources: list[str],
     embed_model_name: str,
     top_k: int = 3,
-    match_threshold: float = 0.28,
-    always_include_latest: bool = True
+    match_threshold: float = 0.28
 ) -> list[dict]:
     if not selected_sources:
         return []
@@ -247,23 +246,31 @@ def retrieve_context(
     }).execute()
     matches = res.data or []
 
-    # Check if user is asking about latest events or has chronological tail enabled
-    needs_tail = always_include_latest or any(kw in query.lower() for kw in LATEST_KEYWORDS)
-    if needs_tail:
-        try:
-            tail_res = supabase.rpc("get_latest_chunks", {
-                "filter_sources": selected_sources,
-                "tail_count": 2
-            }).execute()
-            seen_ids = {m["id"] for m in matches}
-            for tm in reversed(tail_res.data or []):
-                if tm["id"] not in seen_ids:
-                    tm["is_latest_tail"] = True
-                    matches.append(tm)
-        except Exception:
-            pass
+    # Directly fetch the last 2 inserted chunks (end of file) without needing a custom SQL RPC
+    seen_ids = {m["id"] for m in matches}
+    tail_chunks = []
+    for src in selected_sources:
+        if "chat" in src.lower() or len(selected_sources) == 1:
+            try:
+                tail_res = (
+                    supabase.table("documents")
+                    .select("id, content, metadata")
+                    .eq("metadata->>source", src)
+                    .order("id", desc=True)
+                    .limit(2)
+                    .execute()
+                )
+                for tm in reversed(tail_res.data or []):
+                    if tm["id"] not in seen_ids:
+                        tm["similarity"] = 1.0
+                        tm["is_latest_tail"] = True
+                        tail_chunks.append(tm)
+                        seen_ids.add(tm["id"])
+            except Exception:
+                pass
 
-    return matches
+    # Put the latest end-of-file chunks FIRST so they are NEVER cut off by MAX_CONTEXT_CHARS
+    return tail_chunks + matches
 
 def get_stored_sources() -> list[dict]:
     try:
@@ -434,6 +441,8 @@ if selected_sources:
 else:
     st.caption("⚠️ **No knowledge sources selected** — answering using general LLM knowledge only.")
 
+source_chunk_totals = {s["source"]: int(s["chunk_count"]) for s in stored_sources}
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -452,7 +461,7 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
                 else prompt
             )
 
-            matches = retrieve_context(
+            raw_matches = retrieve_context(
                 search_query,
                 selected_sources=selected_sources,
                 embed_model_name=embed_model_choice,
@@ -460,51 +469,76 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
                 match_threshold=threshold_slider
             )
 
-            # Cap total retrieved context at 6,500 chars (~3,800 tokens) to stay under Groq's 7,000 ITPM limit
-            MAX_CONTEXT_CHARS = 6500
-            formatted_chunks = []
+            # Budget characters BEFORE sorting so the latest chunks (at the front of raw_matches) are NEVER dropped
+            MAX_CONTEXT_CHARS = 6800
+            kept_matches = []
             current_chars = 0
-            for m in matches:
-                chunk_str = f"Document: {m.get('metadata', {}).get('source', 'unknown')}\n{m.get('content', '')}"
-                if current_chars + len(chunk_str) > MAX_CONTEXT_CHARS:
+            for m in raw_matches:
+                c_len = len(m.get("content", "")) + 120
+                if current_chars + c_len > MAX_CONTEXT_CHARS:
                     remaining = MAX_CONTEXT_CHARS - current_chars
-                    if remaining > 200:
-                        formatted_chunks.append(chunk_str[:remaining] + "...")
+                    if remaining > 300:
+                        m_copy = dict(m)
+                        m_copy["content"] = m["content"][:remaining] + "..."
+                        kept_matches.append(m_copy)
                     break
-                formatted_chunks.append(chunk_str)
-                current_chars += len(chunk_str)
+                kept_matches.append(m)
+                current_chars += c_len
+
+            # Now sort kept_matches chronologically so the LLM reads from oldest to newest
+            kept_matches.sort(key=lambda x: int(x.get("metadata", {}).get("chunk", 0)))
+
+            formatted_chunks = []
+            for m in kept_matches:
+                meta = m.get("metadata", {})
+                src = meta.get("source", "unknown")
+                chunk_idx = int(meta.get("chunk", 0)) + 1
+                total_for_src = source_chunk_totals.get(src, "?")
+                tail_tag = " [ABSOLUTE END OF FILE — MOST RECENT MESSAGES]" if m.get("is_latest_tail") else ""
+                header = f"Document: {src} (Chunk {chunk_idx} of {total_for_src}{tail_tag})"
+                formatted_chunks.append(f"{header}\n{m.get('content', '')}")
 
             context_block = "\n\n---\n\n".join(formatted_chunks)
 
             system_prompt = (
                 "You are a knowledgeable assistant with access to the user's personal knowledge base. "
-                "Prioritize the retrieved context below when answering. Cite the document name when using "
-                "information from the context. If the context does not contain the answer, state that clearly "
-                "before answering from your general knowledge. Respond in the same language the user writes in "
-                "(e.g., Egyptian Arabic or English).\n\n"
+                "Prioritize the retrieved context below when answering. Pay strict attention to the "
+                "(Chunk X of Total) headers: lower chunk numbers are older, and chunks labeled "
+                "[ABSOLUTE END OF FILE — MOST RECENT MESSAGES] contain the true final dates and messages. "
+                "Respond in the same language the user writes in (e.g., Egyptian Arabic or English).\n\n"
                 f"RETRIEVED CONTEXT:\n{context_block if context_block else 'No matching notes found in selected sources.'}"
             )
 
             recent_history = [
-                {"role": m["role"], "content": m["content"][:600]}
-                for m in st.session_state.messages[-6:-1]
+                {"role": m["role"], "content": m["content"][:400]}
+                for m in st.session_state.messages[-4:-1]
             ] + [st.session_state.messages[-1]]
 
             api_messages = [{"role": "system", "content": system_prompt}] + recent_history
 
-            stream = groq_client.chat.completions.create(
-                model=llm_model,
-                messages=api_messages,
-                temperature=0.2,
-                max_tokens=600,
-                stream=True
-            )
+            completion_kwargs = {
+                "model": llm_model,
+                "messages": api_messages,
+                "temperature": 0.2,
+                "max_tokens": 900,
+                "stream": True
+            }
+            # Disable hidden thinking tokens on Qwen3 models so the full 900 tokens go to the visible reply
+            if "qwen" in llm_model.lower():
+                completion_kwargs["reasoning_effort"] = "none"
+
+            stream = groq_client.chat.completions.create(**completion_kwargs)
             response_text = st.write_stream(chunk.choices[0].delta.content or "" for chunk in stream)
 
-            if matches:
+            if kept_matches:
                 with st.expander(f"📄 View Retrieved Chunks (Search query: '{search_query}')"):
-                    for m in matches:
-                        st.caption(f"**{m.get('metadata', {}).get('source', 'unknown')}** (Hybrid Score: {m['similarity']:.2f})")
+                    for m in kept_matches:
+                        meta = m.get("metadata", {})
+                        src = meta.get("source", "unknown")
+                        c_idx = int(meta.get("chunk", 0)) + 1
+                        t_cnt = source_chunk_totals.get(src, "?")
+                        tag = " 📌 End of File (Latest)" if m.get("is_latest_tail") else f"Hybrid Score: {m['similarity']:.2f}"
+                        st.caption(f"**{src}** — Chunk {c_idx}/{t_cnt} ({tag})")
                         st.write(m["content"])
 
             st.session_state.messages.append({"role": "assistant", "content": response_text})
