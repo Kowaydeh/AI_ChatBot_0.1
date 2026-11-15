@@ -14,7 +14,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 # Switch easily between 72B, 32B, or 7B:
 # "Qwen/Qwen2.5-72B-Instruct" | "Qwen/Qwen2.5-32B-Instruct" | "Qwen/Qwen2.5-7B-Instruct"
 LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
-EMBED_MODEL = "intfloat/multilingual-e5-small"  # 384 dimensions, supports Arabic & English
+EMBED_MODEL = "https://api-inference.huggingface.co/pipeline/feature-extraction/intfloat/multilingual-e5-small"
 
 @st.cache_resource
 def init_clients():
