@@ -12,6 +12,8 @@ from bs4 import BeautifulSoup
 from supabase import create_client
 from fastembed import TextEmbedding
 from groq import Groq
+import gc
+import re
 
 # --- 1. Configuration & Clients ---
 st.set_page_config(page_title="Personal Knowledge AI", page_icon="🧠", layout="wide")
@@ -77,38 +79,83 @@ def extract_text_from_file(uploaded_file) -> str:
         return raw_bytes.decode("utf-8", errors="replace")
 
 # --- 3. Database & Embedding Helpers ---
+def clean_whatsapp_and_noise(text: str) -> str:
+    # Remove WhatsApp omitted media placeholders (English & Arabic) and invisible LTR/RTL marks
+    text = re.sub(r"<Media omitted>|<تم استبعاد الوسائط>|‎", "", text)
+    # Collapse 3+ consecutive blank lines into a single newline
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
+    text = clean_whatsapp_and_noise(text)
+    # Automatically use larger conversational chunks for files > 1 MB
+    if len(text) > 1_000_000:
+        chunk_size = 2400
+        overlap = 200
+
     chunks = []
     start = 0
-    while start < len(text):
+    text_len = len(text)
+    while start < text_len:
         end = start + chunk_size
-        chunks.append(text[start:end].strip())
+        chunk = text[start:end].strip()
+        if len(chunk) > 30:
+            chunks.append(chunk)
         start += chunk_size - overlap
-    return [c for c in chunks if len(c) > 30]
+    return chunks
 
 def get_embedding(text: str, is_query: bool = False) -> list[float]:
     prefix = "query: " if is_query else "passage: "
     vec = list(embed_model.embed([f"{prefix}{text}"]))[0]
     return vec.tolist()
 
+def delete_source(source_name: str):
+    supabase.table("documents").delete().eq("metadata->>source", source_name).execute()
+
 def ingest_document(text: str, source_name: str) -> int:
     chunks = chunk_text(text)
-    if not chunks:
+    total_chunks = len(chunks)
+    if total_chunks == 0:
         return 0
-    prefixed_chunks = [f"passage: {c}" for c in chunks]
-    embeddings = list(embed_model.embed(prefixed_chunks))
-    rows = [
-        {
-            "content": chunk,
-            "metadata": {"source": source_name, "chunk": i},
-            "embedding": emb.tolist()
-        }
-        for i, (chunk, emb) in enumerate(zip(chunks, embeddings))
-    ]
-    # Insert in batches of 100 for large books/EPUBs
-    for idx in range(0, len(rows), 100):
-        supabase.table("documents").insert(rows[idx:idx + 100]).execute()
-    return len(rows)
+
+    # Remove any previous partial upload of the same file to prevent duplicates
+    delete_source(source_name)
+
+    batch_size = 64
+    progress_bar = st.progress(0, text=f"Starting ingestion of {total_chunks} chunks...")
+
+    for start_idx in range(0, total_chunks, batch_size):
+        batch_chunks = chunks[start_idx : start_idx + batch_size]
+        prefixed_batch = [f"passage: {c}" for c in batch_chunks]
+
+        # Embed only 64 chunks in memory at a time
+        batch_embeddings = list(embed_model.embed(prefixed_batch))
+
+        rows = [
+            {
+                "content": chunk,
+                "metadata": {"source": source_name, "chunk": start_idx + i},
+                "embedding": emb.tolist()
+            }
+            for i, (chunk, emb) in enumerate(zip(batch_chunks, batch_embeddings))
+        ]
+
+        supabase.table("documents").insert(rows).execute()
+
+        # Free memory immediately so Streamlit Cloud stays well under 1 GB RAM
+        del batch_embeddings, rows, prefixed_batch
+        gc.collect()
+
+        done = min(start_idx + batch_size, total_chunks)
+        progress_bar.progress(
+            done / total_chunks,
+            text=f"Embedded & stored {done:,} / {total_chunks:,} chunks..."
+        )
+
+    progress_bar.empty()
+    del chunks
+    gc.collect()
+    return total_chunks
 
 def get_stored_sources() -> list[dict]:
     try:
@@ -116,9 +163,6 @@ def get_stored_sources() -> list[dict]:
         return res.data or []
     except Exception:
         return []
-
-def delete_source(source_name: str):
-    supabase.table("documents").delete().eq("metadata->>source", source_name).execute()
 
 def retrieve_context(query: str, selected_sources: list[str], top_k: int = 5) -> list[dict]:
     if not selected_sources:
