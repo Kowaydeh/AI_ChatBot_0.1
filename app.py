@@ -221,12 +221,19 @@ def rewrite_followup_query(user_prompt: str, chat_history: list[dict]) -> str:
     except Exception:
         return user_prompt
 
+LATEST_KEYWORDS = [
+    "أخر", "آخر", "الاخير", "الأخير", "الاخيرة", "الأخيرة", "مؤخرا", "مؤخراً",
+    "دلوقتي", "حاليا", "حالياً", "وصلت", "وصلوا", "نهى", "انتهت", "نهاية",
+    "last", "latest", "recent", "recently", "current", "currently", "now", "end"
+]
+
 def retrieve_context(
     query: str,
     selected_sources: list[str],
     embed_model_name: str,
     top_k: int = 3,
-    match_threshold: float = 0.28
+    match_threshold: float = 0.28,
+    always_include_latest: bool = True
 ) -> list[dict]:
     if not selected_sources:
         return []
@@ -238,7 +245,25 @@ def retrieve_context(
         "filter_sources": selected_sources,
         "query_text": query
     }).execute()
-    return res.data or []
+    matches = res.data or []
+
+    # Check if user is asking about latest events or has chronological tail enabled
+    needs_tail = always_include_latest or any(kw in query.lower() for kw in LATEST_KEYWORDS)
+    if needs_tail:
+        try:
+            tail_res = supabase.rpc("get_latest_chunks", {
+                "filter_sources": selected_sources,
+                "tail_count": 2
+            }).execute()
+            seen_ids = {m["id"] for m in matches}
+            for tm in reversed(tail_res.data or []):
+                if tm["id"] not in seen_ids:
+                    tm["is_latest_tail"] = True
+                    matches.append(tm)
+        except Exception:
+            pass
+
+    return matches
 
 def get_stored_sources() -> list[dict]:
     try:
