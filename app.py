@@ -50,7 +50,7 @@ def load_embedder(model_name: str):
 
 groq_client, supabase = init_core_clients(GROQ_API_KEY, SUPABASE_URL, SUPABASE_KEY)
 
-# --- 3. Multi-Format & Smart WhatsApp Parsing (Priority 5) ---
+# --- 3. Multi-Format & Smart WhatsApp Parsing ---
 WHATSAPP_LINE_RE = re.compile(
     r"^(\[?\d{1,2}[\/\.-]\d{1,2}[\/\.-]\d{2,4},?\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s?[APap][Mm]|[\s\u202f]*[صم])?\]?\s*(?:-|\~)?\s*)"
 )
@@ -92,7 +92,6 @@ def chunk_whatsapp_by_turns(lines: list[str], max_chars: int = 2200, overlap_msg
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
     text = clean_whatsapp_and_noise(text)
     lines = text.splitlines()
-    # Auto-detect WhatsApp logs if >= 5 of the first 40 lines match WhatsApp timestamps
     sample_matches = sum(1 for l in lines[:40] if WHATSAPP_LINE_RE.match(l))
     if sample_matches >= 5:
         return chunk_whatsapp_by_turns(lines)
@@ -146,7 +145,7 @@ def extract_text_from_file(uploaded_file) -> str:
     else:
         return raw_bytes.decode("utf-8", errors="replace")
 
-# --- 4. Database, Hybrid Search & Query Rewriting (Priorities 2, 3, 4) ---
+# --- 4. Database, Hybrid Search & Query Rewriting ---
 def get_embedding(text: str, embed_model_name: str, is_query: bool = False) -> list[float]:
     embedder = load_embedder(embed_model_name)
     prefix = ""
@@ -196,13 +195,13 @@ def ingest_document(text: str, source_name: str, embed_model_name: str) -> int:
     gc.collect()
     return total_chunks
 
-def rewrite_followup_query(user_prompt: str, chat_history: list[dict], llm_model: str) -> str:
+def rewrite_followup_query(user_prompt: str, chat_history: list[dict]) -> str:
     if len(chat_history) < 2:
         return user_prompt
     recent_turns = "\n".join([f"{m['role']}: {m['content'][:300]}" for m in chat_history[-4:]])
     try:
         res = groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b",  # Uses a separate model quota so Qwen's OTPM is untouched
+            model="openai/gpt-oss-20b",
             messages=[
                 {
                     "role": "system",
@@ -226,7 +225,7 @@ def retrieve_context(
     query: str,
     selected_sources: list[str],
     embed_model_name: str,
-    top_k: int = 5,
+    top_k: int = 3,
     match_threshold: float = 0.28
 ) -> list[dict]:
     if not selected_sources:
@@ -287,9 +286,8 @@ if "messages" not in st.session_state:
 if "current_session_id" not in st.session_state:
     st.session_state.current_session_id = None
 
-# --- 7. Sidebar Controls (Priorities 3, 6, 7) ---
+# --- 7. Sidebar Controls ---
 with st.sidebar:
-    # A. Chat History
     st.header("💬 Chat History")
     if st.button("➕ Start New Chat", use_container_width=True):
         st.session_state.current_session_id = None
@@ -319,7 +317,6 @@ with st.sidebar:
 
     st.divider()
 
-    # B. Knowledge Base Manager & Health Status (Priority 7)
     st.header("🗂️ Stored Knowledge Base")
     stored_sources = get_stored_sources()
     all_source_names = [s["source"] for s in stored_sources]
@@ -349,15 +346,15 @@ with st.sidebar:
 
     st.divider()
 
-    # C. Model & Retrieval Tuning Controls (Priorities 3 & 6)
     with st.expander("⚙️ AI & Retrieval Settings", expanded=False):
         llm_model = st.selectbox(
             "Groq LLM Model (switch if rate-limited):",
             options=[
                 "qwen/qwen3.8-27b",
+                "meta-llama/llama-4-scout-17b-16e-instruct",
+                "llama-3.3-70b-versatile",
                 "openai/gpt-oss-120b",
                 "openai/gpt-oss-20b",
-                "llama-3.3-70b-versatile",
                 "llama-3.1-8b-instant"
             ],
             index=0
@@ -377,7 +374,6 @@ with st.sidebar:
 
     st.divider()
 
-    # D. Multi-Format Ingestion
     st.header("📚 Add to Knowledge Base")
     uploaded_files = st.file_uploader(
         "Upload Files (PDF, EPUB, DOCX, TXT, MD, CSV, JSON)",
@@ -426,12 +422,12 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
     with st.chat_message("assistant"):
         try:
             search_query = (
-                rewrite_followup_query(prompt, history_before_prompt, llm_model)
+                rewrite_followup_query(prompt, history_before_prompt)
                 if enable_query_rewrite and history_before_prompt
                 else prompt
             )
 
-           matches = retrieve_context(
+            matches = retrieve_context(
                 search_query,
                 selected_sources=selected_sources,
                 embed_model_name=embed_model_choice,
@@ -439,7 +435,7 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
                 match_threshold=threshold_slider
             )
 
-            # Cap total retrieved context at 6,500 chars (~3,800 tokens) to stay under 7,000 ITPM
+            # Cap total retrieved context at 6,500 chars (~3,800 tokens) to stay under Groq's 7,000 ITPM limit
             MAX_CONTEXT_CHARS = 6500
             formatted_chunks = []
             current_chars = 0
@@ -464,7 +460,6 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
                 f"RETRIEVED CONTEXT:\n{context_block if context_block else 'No matching notes found in selected sources.'}"
             )
 
-            # Trim older history messages to 600 chars each so multi-turn chats never overflow ITPM
             recent_history = [
                 {"role": m["role"], "content": m["content"][:600]}
                 for m in st.session_state.messages[-6:-1]
@@ -476,7 +471,7 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
                 model=llm_model,
                 messages=api_messages,
                 temperature=0.2,
-                max_tokens=600,  # Safely below Groq's 1,000 OTPM free-tier limit
+                max_tokens=600,
                 stream=True
             )
             response_text = st.write_stream(chunk.choices[0].delta.content or "" for chunk in stream)
