@@ -371,7 +371,7 @@ with st.sidebar:
             index=0,
             help="Keep BAAI/bge-small-en-v1.5 for already-uploaded chunks, or switch to Multilingual MiniLM before re-uploading Arabic/multilingual files."
         )
-        top_k_slider = st.slider("Chunks to Retrieve (Top-K):", min_value=2, max_value=10, value=5)
+        top_k_slider = st.slider("Chunks to Retrieve (Top-K):", min_value=1, max_value=10, value=3)
         threshold_slider = st.slider("Similarity Threshold:", min_value=0.10, max_value=0.70, value=0.28, step=0.02)
         enable_query_rewrite = st.checkbox("Contextual Follow-Up Query Rewriting", value=True)
 
@@ -431,16 +431,29 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
                 else prompt
             )
 
-            matches = retrieve_context(
+           matches = retrieve_context(
                 search_query,
                 selected_sources=selected_sources,
                 embed_model_name=embed_model_choice,
                 top_k=top_k_slider,
                 match_threshold=threshold_slider
             )
-            context_block = "\n\n---\n\n".join(
-                [f"Document: {m.get('metadata', {}).get('source', 'unknown')}\n{m.get('content', '')}" for m in matches]
-            )
+
+            # Cap total retrieved context at 6,500 chars (~3,800 tokens) to stay under 7,000 ITPM
+            MAX_CONTEXT_CHARS = 6500
+            formatted_chunks = []
+            current_chars = 0
+            for m in matches:
+                chunk_str = f"Document: {m.get('metadata', {}).get('source', 'unknown')}\n{m.get('content', '')}"
+                if current_chars + len(chunk_str) > MAX_CONTEXT_CHARS:
+                    remaining = MAX_CONTEXT_CHARS - current_chars
+                    if remaining > 200:
+                        formatted_chunks.append(chunk_str[:remaining] + "...")
+                    break
+                formatted_chunks.append(chunk_str)
+                current_chars += len(chunk_str)
+
+            context_block = "\n\n---\n\n".join(formatted_chunks)
 
             system_prompt = (
                 "You are a knowledgeable assistant with access to the user's personal knowledge base. "
@@ -451,7 +464,13 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
                 f"RETRIEVED CONTEXT:\n{context_block if context_block else 'No matching notes found in selected sources.'}"
             )
 
-            api_messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages[-8:]
+            # Trim older history messages to 600 chars each so multi-turn chats never overflow ITPM
+            recent_history = [
+                {"role": m["role"], "content": m["content"][:600]}
+                for m in st.session_state.messages[-6:-1]
+            ] + [st.session_state.messages[-1]]
+
+            api_messages = [{"role": "system", "content": system_prompt}] + recent_history
 
             stream = groq_client.chat.completions.create(
                 model=llm_model,
