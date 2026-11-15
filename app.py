@@ -202,7 +202,7 @@ def rewrite_followup_query(user_prompt: str, chat_history: list[dict], llm_model
     recent_turns = "\n".join([f"{m['role']}: {m['content'][:300]}" for m in chat_history[-4:]])
     try:
         res = groq_client.chat.completions.create(
-            model=llm_model,
+            model="openai/gpt-oss-20b",  # Uses a separate model quota so Qwen's OTPM is untouched
             messages=[
                 {
                     "role": "system",
@@ -215,7 +215,7 @@ def rewrite_followup_query(user_prompt: str, chat_history: list[dict], llm_model
                 {"role": "user", "content": f"Recent Chat:\n{recent_turns}\n\nLatest Input: {user_prompt}"}
             ],
             temperature=0.0,
-            max_tokens=80
+            max_tokens=60
         )
         rewritten = res.choices[0].message.content.strip()
         return rewritten if rewritten else user_prompt
@@ -355,9 +355,10 @@ with st.sidebar:
             "Groq LLM Model (switch if rate-limited):",
             options=[
                 "qwen/qwen3.8-27b",
-                "qwen/qwen3.6-27b",
                 "openai/gpt-oss-120b",
-                "openai/gpt-oss-20b"
+                "openai/gpt-oss-20b",
+                "llama-3.3-70b-versatile",
+                "llama-3.1-8b-instant"
             ],
             index=0
         )
@@ -456,7 +457,7 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
                 model=llm_model,
                 messages=api_messages,
                 temperature=0.2,
-                max_tokens=1024,
+                max_tokens=600,  # Safely below Groq's 1,000 OTPM free-tier limit
                 stream=True
             )
             response_text = st.write_stream(chunk.choices[0].delta.content or "" for chunk in stream)
