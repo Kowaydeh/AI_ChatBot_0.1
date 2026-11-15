@@ -8,22 +8,25 @@ from groq import Groq
 # --- 1. Configuration & Clients ---
 st.set_page_config(page_title="Personal Knowledge AI", page_icon="🧠", layout="wide")
 
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY"))
-SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.environ.get("SUPABASE_URL"))
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.environ.get("SUPABASE_KEY"))
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", "")).strip()
+RAW_SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.environ.get("SUPABASE_URL", "")).strip()
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.environ.get("SUPABASE_KEY", "")).strip()
 
-# Supported Groq free-tier models: "qwen/qwen3.8-27b" | "openai/gpt-oss-120b" | "openai/gpt-oss-20b"
+# Guarantee clean root URL with no trailing slash or /rest/v1
+SUPABASE_URL = RAW_SUPABASE_URL.split("/rest/v1")[0].rstrip("/")
+
+# Supported Groq models: "qwen/qwen3.8-27b" | "openai/gpt-oss-120b" | "openai/gpt-oss-20b"
 LLM_MODEL = "qwen/qwen3.8-27b"
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"  # 384 dimensions, runs on Streamlit Cloud CPU via ONNX
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"  # 384 dimensions
 
 @st.cache_resource
-def init_clients():
+def init_clients(groq_key: str, sb_url: str, sb_key: str):
     embedder = TextEmbedding(model_name=EMBED_MODEL)
-    groq_client = Groq(api_key=GROQ_API_KEY)
-    sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    groq_client = Groq(api_key=groq_key)
+    sb_client = create_client(sb_url, sb_key)
     return embedder, groq_client, sb_client
 
-embed_model, groq_client, supabase = init_clients()
+embed_model, groq_client, supabase = init_clients(GROQ_API_KEY, SUPABASE_URL, SUPABASE_KEY)
 
 # --- 2. Helper Functions ---
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
@@ -44,7 +47,6 @@ def ingest_document(text: str, source_name: str):
     chunks = chunk_text(text)
     if not chunks:
         return 0
-    # Batch-embed all chunks at once in memory
     prefixed_chunks = [f"passage: {c}" for c in chunks]
     embeddings = list(embed_model.embed(prefixed_chunks))
     rows = [
@@ -109,34 +111,37 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        matches = retrieve_context(prompt)
-        context_block = "\n\n---\n\n".join(
-            [f"Document: {m.get('metadata', {}).get('source', 'unknown')}\n{m.get('content', '')}" for m in matches]
-        )
+        try:
+            matches = retrieve_context(prompt)
+            context_block = "\n\n---\n\n".join(
+                [f"Document: {m.get('metadata', {}).get('source', 'unknown')}\n{m.get('content', '')}" for m in matches]
+            )
 
-        system_prompt = (
-            "You are a knowledgeable assistant with access to the user's personal knowledge base. "
-            "Prioritize the retrieved context below when answering. If the context does not contain "
-            "the answer, state that clearly before answering from your general knowledge. "
-            "Respond in the same language the user writes in (e.g., Arabic or English).\n\n"
-            f"RETRIEVED CONTEXT:\n{context_block if context_block else 'No matching notes found.'}"
-        )
+            system_prompt = (
+                "You are a knowledgeable assistant with access to the user's personal knowledge base. "
+                "Prioritize the retrieved context below when answering. If the context does not contain "
+                "the answer, state that clearly before answering from your general knowledge. "
+                "Respond in the same language the user writes in (e.g., Arabic or English).\n\n"
+                f"RETRIEVED CONTEXT:\n{context_block if context_block else 'No matching notes found.'}"
+            )
 
-        api_messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages[-6:]
+            api_messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages[-6:]
 
-        stream = groq_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=api_messages,
-            temperature=0.2,
-            max_tokens=1024,
-            stream=True
-        )
-        response_text = st.write_stream(chunk.choices[0].delta.content or "" for chunk in stream)
+            stream = groq_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=api_messages,
+                temperature=0.2,
+                max_tokens=1024,
+                stream=True
+            )
+            response_text = st.write_stream(chunk.choices[0].delta.content or "" for chunk in stream)
 
-        if matches:
-            with st.expander("📄 View Retrieved Knowledge Chunks"):
-                for m in matches:
-                    st.caption(f"**{m.get('metadata', {}).get('source', 'unknown')}** (Similarity: {m['similarity']:.2f})")
-                    st.write(m["content"])
+            if matches:
+                with st.expander("📄 View Retrieved Knowledge Chunks"):
+                    for m in matches:
+                        st.caption(f"**{m.get('metadata', {}).get('source', 'unknown')}** (Similarity: {m['similarity']:.2f})")
+                        st.write(m["content"])
 
-    st.session_state.messages.append({"role": "assistant", "content": response_text})
+            st.session_state.messages.append({"role": "assistant", "content": response_text})
+        except Exception as e:
+            st.error(f"Chat / Retrieval Error: {e}")
