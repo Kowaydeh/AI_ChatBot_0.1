@@ -111,7 +111,7 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
     with st.chat_message("assistant"):
         matches = retrieve_context(prompt)
         context_block = "\n\n---\n\n".join(
-            [f".get('source', 'unknown')}]\n{m['content']}" for m in matches]
+            [f"Document: {m.get('metadata', {}).get('source', 'unknown')}\n{m.get('content', '')}" for m in matches]
         )
 
         system_prompt = (
@@ -136,7 +136,7 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
         if matches:
             with st.expander("📄 View Retrieved Knowledge Chunks"):
                 for m in matches:
-                    st.caption(f"**{m['metadata'].get('source')}** (Similarity: {m['similarity']:.2f})")
+                    st.caption(f"**{m.get('metadata', {}).get('source', 'unknown')}** (Similarity: {m['similarity']:.2f})")
                     st.write(m["content"])
 
     st.session_state.messages.append({"role": "assistant", "content": response_text})
