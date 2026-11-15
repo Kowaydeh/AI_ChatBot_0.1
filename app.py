@@ -2,26 +2,28 @@ import os
 import streamlit as st
 from pypdf import PdfReader
 from supabase import create_client
-from huggingface_hub import InferenceClient
+from fastembed import TextEmbedding
+from groq import Groq
 
 # --- 1. Configuration & Clients ---
 st.set_page_config(page_title="Personal Knowledge AI", page_icon="🧠", layout="wide")
 
-HF_TOKEN = st.secrets.get("HF_TOKEN", os.environ.get("HF_TOKEN"))
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY"))
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.environ.get("SUPABASE_URL"))
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.environ.get("SUPABASE_KEY"))
 
-LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
-# Native feature-extraction model (384 dimensions) hosted on HF Inference API
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+# Supported Groq free-tier models: "qwen/qwen3.8-27b" | "openai/gpt-oss-120b" | "openai/gpt-oss-20b"
+LLM_MODEL = "qwen/qwen3.8-27b"
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"  # 384 dimensions, runs on Streamlit Cloud CPU via ONNX
 
 @st.cache_resource
 def init_clients():
-    hf_client = InferenceClient(api_key=HF_TOKEN)
+    embedder = TextEmbedding(model_name=EMBED_MODEL)
+    groq_client = Groq(api_key=GROQ_API_KEY)
     sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return hf_client, sb_client
+    return embedder, groq_client, sb_client
 
-hf, supabase = init_clients()
+embed_model, groq_client, supabase = init_clients()
 
 # --- 2. Helper Functions ---
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
@@ -34,24 +36,26 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str
     return [c for c in chunks if len(c) > 30]
 
 def get_embedding(text: str, is_query: bool = False) -> list[float]:
-    prefix = "Represent this sentence for searching relevant passages: " if is_query else ""
-    vec = hf.feature_extraction(f"{prefix}{text}", model=EMBED_MODEL)
-    if hasattr(vec, "flatten"):
-        return vec.flatten().tolist()
-    return vec[0] if isinstance(vec[0], list) else list(vec)
+    prefix = "query: " if is_query else "passage: "
+    vec = list(embed_model.embed([f"{prefix}{text}"]))[0]
+    return vec.tolist()
 
 def ingest_document(text: str, source_name: str):
     chunks = chunk_text(text)
-    rows = []
-    for i, chunk in enumerate(chunks):
-        emb = get_embedding(chunk, is_query=False)
-        rows.append({
+    if not chunks:
+        return 0
+    # Batch-embed all chunks at once in memory
+    prefixed_chunks = [f"passage: {c}" for c in chunks]
+    embeddings = list(embed_model.embed(prefixed_chunks))
+    rows = [
+        {
             "content": chunk,
             "metadata": {"source": source_name, "chunk": i},
-            "embedding": emb
-        })
-    if rows:
-        supabase.table("documents").insert(rows).execute()
+            "embedding": emb.tolist()
+        }
+        for i, (chunk, emb) in enumerate(zip(chunks, embeddings))
+    ]
+    supabase.table("documents").insert(rows).execute()
     return len(rows)
 
 def retrieve_context(query: str, top_k: int = 4) -> list[dict]:
@@ -86,9 +90,11 @@ with st.sidebar:
                     st.success(f"Stored {count} chunks from '{source_label}'!")
                 except Exception as e:
                     st.error(f"Ingestion failed: {e}")
-                    
+        else:
+            st.warning("Please upload a PDF or paste text first.")
+
 # --- 4. Main Chat Interface ---
-st.title("🧠 Personal RAG Assistant (Qwen 2.5)")
+st.title("🧠 Personal RAG Assistant")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -105,7 +111,7 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
     with st.chat_message("assistant"):
         matches = retrieve_context(prompt)
         context_block = "\n\n---\n\n".join(
-            [f"[Source: {m['metadata'].get('source', 'unknown')}]\n{m['content']}" for m in matches]
+            [f".get('source', 'unknown')}]\n{m['content']}" for m in matches]
         )
 
         system_prompt = (
@@ -118,7 +124,7 @@ if prompt := st.chat_input("Ask me anything about your knowledge base..."):
 
         api_messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages[-6:]
 
-        stream = hf.chat.completions.create(
+        stream = groq_client.chat.completions.create(
             model=LLM_MODEL,
             messages=api_messages,
             temperature=0.2,
