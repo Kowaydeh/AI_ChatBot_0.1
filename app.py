@@ -5,16 +5,15 @@ from supabase import create_client
 from huggingface_hub import InferenceClient
 
 # --- 1. Configuration & Clients ---
-st.set_page_config(page_title="AI_ChatBot_0.1", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Personal Knowledge AI", page_icon="🧠", layout="wide")
 
-HF_TOKEN = os.environ.get("HF_TOKEN")
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+HF_TOKEN = st.secrets.get("HF_TOKEN", os.environ.get("HF_TOKEN"))
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.environ.get("SUPABASE_URL"))
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.environ.get("SUPABASE_KEY"))
 
-# Switch easily between 72B, 32B, or 7B:
-# "Qwen/Qwen2.5-72B-Instruct" | "Qwen/Qwen2.5-32B-Instruct" | "Qwen/Qwen2.5-7B-Instruct"
 LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
-EMBED_MODEL = "https://router.huggingface.co/hf-inference/models/intfloat/multilingual-e5-small/pipeline/feature-extraction"
+# Native feature-extraction model (384 dimensions) hosted on HF Inference API
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 
 @st.cache_resource
 def init_clients():
@@ -35,12 +34,12 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str
     return [c for c in chunks if len(c) > 30]
 
 def get_embedding(text: str, is_query: bool = False) -> list[float]:
-    prefix = "query: " if is_query else "passage: "
+    prefix = "Represent this sentence for searching relevant passages: " if is_query else ""
     vec = hf.feature_extraction(f"{prefix}{text}", model=EMBED_MODEL)
     if hasattr(vec, "flatten"):
         return vec.flatten().tolist()
     return vec[0] if isinstance(vec[0], list) else list(vec)
-    
+
 def ingest_document(text: str, source_name: str):
     chunks = chunk_text(text)
     rows = []
@@ -82,11 +81,12 @@ with st.sidebar:
 
         if full_text:
             with st.spinner("Embedding and storing in Supabase..."):
-                count = ingest_document(full_text, source_label)
-                st.success(f"Stored {count} chunks from '{source_label}'!")
-        else:
-            st.warning("Please upload a PDF or paste text first.")
-
+                try:
+                    count = ingest_document(full_text, source_label)
+                    st.success(f"Stored {count} chunks from '{source_label}'!")
+                except Exception as e:
+                    st.error(f"Ingestion failed: {e}")
+                    
 # --- 4. Main Chat Interface ---
 st.title("🧠 Personal RAG Assistant (Qwen 2.5)")
 
