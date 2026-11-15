@@ -14,7 +14,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 # Switch easily between 72B, 32B, or 7B:
 # "Qwen/Qwen2.5-72B-Instruct" | "Qwen/Qwen2.5-32B-Instruct" | "Qwen/Qwen2.5-7B-Instruct"
 LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
-EMBED_MODEL = "https://api-inference.huggingface.co/pipeline/feature-extraction/intfloat/multilingual-e5-small"
+EMBED_MODEL = "https://router.huggingface.co/hf-inference/models/intfloat/multilingual-e5-small/pipeline/feature-extraction"
 
 @st.cache_resource
 def init_clients():
@@ -35,11 +35,12 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str
     return [c for c in chunks if len(c) > 30]
 
 def get_embedding(text: str, is_query: bool = False) -> list[float]:
-    # E5 models expect "query: " or "passage: " prefixes for optimal retrieval
     prefix = "query: " if is_query else "passage: "
     vec = hf.feature_extraction(f"{prefix}{text}", model=EMBED_MODEL)
-    return vec.tolist() if hasattr(vec, "tolist") else list(vec)
-
+    if hasattr(vec, "flatten"):
+        return vec.flatten().tolist()
+    return vec[0] if isinstance(vec[0], list) else list(vec)
+    
 def ingest_document(text: str, source_name: str):
     chunks = chunk_text(text)
     rows = []
